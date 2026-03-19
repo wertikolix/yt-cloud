@@ -1,610 +1,760 @@
-# youtube_storage_fixed.py
+#!/usr/bin/env python3
+"""
+yt-cloud coder — стеганографическое хранение файлов в видео.
+Кодирует произвольные файлы в цветовые блоки на видеокадрах,
+устойчивые к YouTube-сжатию. Декодирует обратно без потерь.
+"""
+
+import argparse
 import cv2
+import hashlib
+import math
 import numpy as np
 import os
-import math
+import re
+import struct
 import subprocess
+import sys
 import tempfile
 import shutil
-import sys
-import re
-import hashlib
-from collections import Counter
+from io import BytesIO
+from tqdm import tqdm
 
-class YouTubeEncoder:
-    def __init__(self, key=None):
-        self.width = 1920
-        self.height = 1080
-        self.fps = 6  # ИЗМЕНЕНО: теперь 6 кадров в секунду
-        
-        # Параметры
-        self.block_height = 16
-        self.block_width = 24
-        self.spacing = 4
-        
-        # Ключ шифрования
-        self.key = key
-        self.use_encryption = key is not None
-        
-        # 16 цветов
-        self.colors = {
-            '0000': (255, 0, 0),      # Ярко-синий
-            '0001': (0, 255, 0),      # Ярко-зеленый
-            '0010': (0, 0, 255),      # Ярко-красный
-            '0011': (255, 255, 0),    # Желтый
-            '0100': (255, 0, 255),    # Пурпурный
-            '0101': (0, 255, 255),    # Голубой
-            '0110': (255, 128, 0),    # Оранжевый
-            '0111': (128, 0, 255),    # Фиолетовый
-            '1000': (0, 128, 128),    # Бирюзовый
-            '1001': (128, 128, 0),    # Оливковый
-            '1010': (128, 0, 128),    # Темно-пурпурный
-            '1011': (0, 128, 0),      # Темно-зеленый
-            '1100': (128, 0, 0),      # Бордовый
-            '1101': (0, 0, 128),      # Темно-синий
-            '1110': (192, 192, 192),  # Светло-серый
-            '1111': (255, 255, 255)   # Белый
-        }
-        
-        # Маркеры по углам
-        self.marker_size = 80
-        
-        # Расчет сетки
-        self.blocks_x = (self.width - 2*self.marker_size) // (self.block_width + self.spacing)
-        self.blocks_y = (self.height - 2*self.marker_size) // (self.block_height + self.spacing)
-        self.blocks_per_region = self.blocks_x * self.blocks_y
-        self.blocks_per_frame = self.blocks_per_region * 3
-        
-        # Маркер конца
-        self.eof_marker = "█" * 64
-        self.eof_bytes = self.eof_marker.encode('utf-8')
-        
-        print("="*60)
-        print("🎬 КОДИРОВЩИК YouTube (6 FPS)")
-        print("="*60)
-        print(f"📊 Сетка: {self.blocks_x} x {self.blocks_y} блоков на регион")
-        print(f"🎞️  FPS: {self.fps}")
-        print(f"🔐 Шифрование: {'ВКЛ' if self.use_encryption else 'ВЫКЛ'}")
-    
-    def _encrypt_data(self, data):
-        """XOR шифрование с ключом"""
-        if not self.use_encryption:
-            return data
-        
-        key_bytes = self.key.encode()
-        result = bytearray()
-        
-        for i, byte in enumerate(data):
-            key_byte = key_bytes[i % len(key_bytes)]
-            result.append(byte ^ key_byte)
-        
-        return result
-    
-    def _draw_markers(self, frame):
-        """Рисует маркеры по углам"""
-        cv2.rectangle(frame, (0, 0), (self.marker_size, self.marker_size), (255, 255, 255), -1)
-        cv2.rectangle(frame, (self.width-self.marker_size, 0), (self.width, self.marker_size), (255, 255, 255), -1)
-        cv2.rectangle(frame, (0, self.height-self.marker_size), (self.marker_size, self.height), (255, 255, 255), -1)
-        cv2.rectangle(frame, (self.width-self.marker_size, self.height-self.marker_size), (self.width, self.height), (255, 255, 255), -1)
-        
-        cv2.rectangle(frame, (0, 0), (self.marker_size, self.marker_size), (0, 0, 0), 2)
-        cv2.rectangle(frame, (self.width-self.marker_size, 0), (self.width, self.marker_size), (0, 0, 0), 2)
-        cv2.rectangle(frame, (0, self.height-self.marker_size), (self.marker_size, self.height), (0, 0, 0), 2)
-        cv2.rectangle(frame, (self.width-self.marker_size, self.height-self.marker_size), (self.width, self.height), (0, 0, 0), 2)
-        
-        return frame
-    
-    def _draw_block(self, frame, x, y, color):
-        """Рисует один блок"""
-        x1 = self.marker_size + x * (self.block_width + self.spacing)
-        y1 = self.marker_size + y * (self.block_height + self.spacing)
-        x2 = x1 + self.block_width
-        y2 = y1 + self.block_height
-        
-        if x2 > self.width - self.marker_size or y2 > self.height - self.marker_size:
-            return False
-        
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, -1)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), 1)
-        return True
-    
-    def _bits_to_color(self, bits):
-        """4 бита -> цвет"""
-        while len(bits) < 4:
-            bits = '0' + bits
-        return self.colors.get(bits, (255, 0, 0))
-    
-    def _data_to_blocks(self, data):
-        """Конвертирует данные в 4-битные блоки"""
-        all_bits = []
-        for byte in data:
-            for i in range(7, -1, -1):
-                all_bits.append(str((byte >> i) & 1))
-        
-        while len(all_bits) % 4 != 0:
-            all_bits.append('0')
-        
-        blocks = [''.join(all_bits[i:i+4]) for i in range(0, len(all_bits), 4)]
-        return blocks
-    
-    def encode(self, input_file, output_file):
-        """Кодирует файл в видео с опциональным шифрованием"""
-        
-        print("\n📤 КОДИРОВАНИЕ ФАЙЛА")
-        print("-" * 40)
-        
-        # Читаем файл
-        with open(input_file, 'rb') as f:
-            data = f.read()
-        
-        print(f"📄 Файл: {input_file}")
-        print(f"📦 Размер: {len(data)} байт")
-        
-        # Шифруем данные если нужно
-        if self.use_encryption:
-            encrypted_data = self._encrypt_data(data)
-            print(f"🔐 Данные зашифрованы")
-        else:
-            encrypted_data = data
-        
-        # Создаем заголовок
-        header = f"FILE:{os.path.basename(input_file)}:SIZE:{len(data)}|"
-        header_bytes = header.encode('latin-1')
-        print(f"📋 Заголовок: {header}")
-        
-        # Конвертируем в блоки
-        header_blocks = self._data_to_blocks(header_bytes)
-        data_blocks = self._data_to_blocks(encrypted_data)
-        eof_blocks = self._data_to_blocks(self.eof_bytes)
-        all_blocks = header_blocks + data_blocks + eof_blocks
-        
-        print(f"🎨 Всего блоков: {len(all_blocks)}")
-        print(f"🏁 Маркер конца: {len(eof_blocks)} блоков")
-        
-        # Рассчитываем количество кадров
-        frames_needed = math.ceil(len(all_blocks) / self.blocks_per_region)
-        # Добавляем 5 защитных кадров
-        frames_needed += 5
-        print(f"🎬 Требуется кадров: {frames_needed}")
-        print(f"⏱️  Длительность видео: {frames_needed/self.fps:.1f} сек")
-        
-        # Создаем временную папку
-        temp_dir = tempfile.mkdtemp()
-        print(f"📁 Временная папка: {temp_dir}")
-        
-        # Создаем кадры
-        for frame_num in range(frames_needed - 5):
-            print(f"\n🖼️  Кадр {frame_num + 1}/{frames_needed}")
-            
-            frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-            frame = self._draw_markers(frame)
-            
-            start_idx = frame_num * self.blocks_per_region
-            end_idx = min(start_idx + self.blocks_per_region, len(all_blocks))
-            frame_blocks = all_blocks[start_idx:end_idx]
-            
-            # Основные блоки
-            for idx, bits in enumerate(frame_blocks):
-                y = idx // self.blocks_x
-                x = idx % self.blocks_x
-                if y < self.blocks_y:
-                    color = self._bits_to_color(bits)
-                    self._draw_block(frame, x, y, color)
-            
-            # Резерв 1
-            for idx, bits in enumerate(frame_blocks):
-                y = idx // self.blocks_x
-                x = idx % self.blocks_x + self.blocks_x
-                if x < self.blocks_x * 2 and y < self.blocks_y:
-                    color = self._bits_to_color(bits)
-                    self._draw_block(frame, x, y, color)
-            
-            # Резерв 2
-            for idx, bits in enumerate(frame_blocks):
-                y = idx // self.blocks_x + self.blocks_y
-                x = idx % self.blocks_x
-                if x < self.blocks_x and y < self.blocks_y * 2:
-                    color = self._bits_to_color(bits)
-                    self._draw_block(frame, x, y, color)
-            
-            # Сохраняем кадр
-            frame_file = os.path.join(temp_dir, f"frame_{frame_num:05d}.png")
-            cv2.imwrite(frame_file, frame)
-        
-        # Создаем защитные кадры (синий фон)
-        print("\n🛡️  Создание защитных кадров...")
-        for i in range(5):
-            frame_num = frames_needed - 5 + i
-            frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
-            frame = self._draw_markers(frame)
-            for y in range(self.blocks_y * 2):
-                for x in range(self.blocks_x * 2):
-                    self._draw_block(frame, x, y, (255, 0, 0))
-            frame_file = os.path.join(temp_dir, f"frame_{frame_num:05d}.png")
-            cv2.imwrite(frame_file, frame)
-            print(f"  🟦 Защитный кадр {i+1}/5")
-        
-        # Конвертируем в MP4
-        print("\n🎞️  Конвертация в MP4...")
-        
-        try:
-            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-            
-            cmd = [
-                'ffmpeg',
-                '-framerate', str(self.fps),
-                '-i', os.path.join(temp_dir, 'frame_%05d.png'),
-                '-c:v', 'libx264',
-                '-preset', 'slow',
-                '-crf', '23',
-                '-pix_fmt', 'yuv420p',
-                '-an',
-                '-movflags', '+faststart',
-                '-y',
-                output_file
-            ]
-            
-            subprocess.run(cmd, check=True, capture_output=True)
-            print("✅ FFmpeg конвертация успешна")
-            
-        except Exception as e:
-            print(f"⚠️ FFmpeg не доступен, использую OpenCV...")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_file, fourcc, self.fps, (self.width, self.height))
-            
-            for frame_num in range(frames_needed):
-                frame_file = os.path.join(temp_dir, f"frame_{frame_num:05d}.png")
-                frame = cv2.imread(frame_file)
-                if frame is not None:
-                    out.write(frame)
-            out.release()
-        
-        # Удаляем временные файлы
-        shutil.rmtree(temp_dir)
-        print("🧹 Временные файлы удалены")
-        
-        if os.path.exists(output_file):
-            size = os.path.getsize(output_file)
-            print(f"\n✅ Видео сохранено: {output_file}")
-            print(f"📊 Размер: {size} байт ({size/1024/1024:.2f} MB)")
-            print(f"🎬 Кадров: {frames_needed}")
-            print(f"⏱️  Длительность: {frames_needed/self.fps:.1f} сек")
-            return True
-        return False
+# ─── Опционально: AES-256-GCM ───────────────────────────────────────────────
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.primitives import hashes
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ПАЛИТРА — 16 цветов, максимально разнесённых в YUV-пространстве
+# ═════════════════════════════════════════════════════════════════════════════
+# BGR-формат (OpenCV native).
+# Выбраны так, чтобы после YUV420 chroma subsampling расстояния оставались
+# максимальными. Чёрный (0,0,0) НЕ используется — это фон.
+
+PALETTE_BGR = [
+    (0,   0,   255),   # 0  — красный
+    (0,   255, 0),     # 1  — зелёный
+    (255, 0,   0),     # 2  — синий
+    (0,   255, 255),   # 3  — жёлтый
+    (255, 0,   255),   # 4  — маджента
+    (255, 255, 0),     # 5  — циан
+    (255, 255, 255),   # 6  — белый
+    (0,   128, 255),   # 7  — оранжевый
+    (128, 0,   255),   # 8  — розовый/фиолетовый
+    (0,   255, 128),   # 9  — лайм
+    (255, 128, 0),     # 10 — голубой (светлый)
+    (128, 255, 0),     # 11 — бирюза
+    (0,   0,   128),   # 12 — тёмно-красный
+    (0,   128, 0),     # 13 — тёмно-зелёный
+    (128, 0,   0),     # 14 — тёмно-синий
+    (128, 128, 128),   # 15 — серый
+]
+
+PALETTE_NP = np.array(PALETTE_BGR, dtype=np.int32)  # для быстрого nearest-neighbor
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  КОНСТАНТЫ ФОРМАТА
+# ═════════════════════════════════════════════════════════════════════════════
+
+WIDTH = 1920
+HEIGHT = 1080
+FPS = 6
+
+BLOCK_W = 40         # Ширина блока (px) — крупнее = устойчивее к сжатию
+BLOCK_H = 40         # Высота блока
+SPACING = 4          # Промежуток между блоками (чёрный, визуальный разделитель)
+MARKER_SIZE = 0      # Убраны corner-маркеры — бесполезны для декодирования
+
+# Сетка данных
+STEP_X = BLOCK_W + SPACING
+STEP_Y = BLOCK_H + SPACING
+GRID_COLS = WIDTH // STEP_X        # сколько блоков по X
+GRID_ROWS = HEIGHT // STEP_Y       # сколько блоков по Y
+
+# Первые 2 строки блоков — служебные (номер кадра + CRC кадра).
+# Номер кадра: 4 блока = 4*4 = 16 бит = до 65535 кадров.
+# CRC кадра: 4 блока = 16 бит CRC-16 данных на кадре.
+HEADER_BLOCKS = 8  # 4 frame_num + 4 crc16
+DATA_ROWS_START = 0  # данные начинаются с первого блока после header
+
+BLOCKS_PER_REGION = GRID_COLS * GRID_ROWS - HEADER_BLOCKS
+# Формат 3-х регионов: мы делим кадр на 3 горизонтальные полосы
+# Каждая полоса — независимая копия тех же данных.
+# При декодировании — majority vote по 3 копиям на каждый блок.
+
+# Пересчитываем: сетка делится на 3 полосы
+REGION_ROWS = GRID_ROWS // 3
+BLOCKS_PER_REGION = GRID_COLS * REGION_ROWS - HEADER_BLOCKS  # данных на регион
+
+# Гарантируем что хватает строк
+assert REGION_ROWS >= 2, f"Слишком мало строк ({REGION_ROWS}) для региона"
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  УТИЛИТЫ
+# ═════════════════════════════════════════════════════════════════════════════
+
+def nibbles_from_bytes(data: bytes):
+    """Генератор: байты → 4-битные значения (0-15)."""
+    for b in data:
+        yield (b >> 4) & 0x0F
+        yield b & 0x0F
 
 
-class YouTubeDecoder:
-    def __init__(self, key=None):
-        self.width = 1920
-        self.height = 1080
-        self.block_height = 16
-        self.block_width = 24
-        self.spacing = 4
-        self.marker_size = 80
-        
-        # Ключ шифрования
-        self.key = key
-        
-        # 16 цветов
-        self.colors = {
-            '0000': (255, 0, 0),
-            '0001': (0, 255, 0),
-            '0010': (0, 0, 255),
-            '0011': (255, 255, 0),
-            '0100': (255, 0, 255),
-            '0101': (0, 255, 255),
-            '0110': (255, 128, 0),
-            '0111': (128, 0, 255),
-            '1000': (0, 128, 128),
-            '1001': (128, 128, 0),
-            '1010': (128, 0, 128),
-            '1011': (0, 128, 0),
-            '1100': (128, 0, 0),
-            '1101': (0, 0, 128),
-            '1110': (192, 192, 192),
-            '1111': (255, 255, 255)
-        }
-        
-        # Оптимизации
-        self.color_values = np.array(list(self.colors.values()), dtype=np.int32)
-        self.color_keys = list(self.colors.keys())
-        self.color_cache = {}
-        self.cache_hits = 0
-        self.cache_misses = 0
-        
-        # Расчет сетки
-        self.blocks_x = (self.width - 2*self.marker_size) // (self.block_width + self.spacing)
-        self.blocks_y = (self.height - 2*self.marker_size) // (self.block_height + self.spacing)
-        self.blocks_per_region = self.blocks_x * self.blocks_y
-        
-        # Предвычисление координат
-        self._precompute_coordinates()
-        
-        print("="*60)
-        print("🎬 ДЕКОДЕР YouTube")
-        print("="*60)
-        print(f"📊 Сетка: {self.blocks_x} x {self.blocks_y} блоков")
-        print(f"🔐 Ключ: {'ЕСТЬ' if self.key else 'НЕТ'}")
-    
-    def _precompute_coordinates(self):
-        """Предвычисляет координаты блоков"""
-        self.block_coords = []
-        for idx in range(self.blocks_per_region):
-            y = idx // self.blocks_x
-            x = idx % self.blocks_x
-            if y < self.blocks_y:
-                cx = self.marker_size + x * (self.block_width + self.spacing) + self.block_width // 2
-                cy = self.marker_size + y * (self.block_height + self.spacing) + self.block_height // 2
-                self.block_coords.append((cx, cy))
-    
-    def _decrypt_data(self, data):
-        """XOR дешифрование с ключом"""
-        if not self.key:
-            return data
-        
-        key_bytes = self.key.encode()
-        result = bytearray()
-        
-        for i, byte in enumerate(data):
-            key_byte = key_bytes[i % len(key_bytes)]
-            result.append(byte ^ key_byte)
-        
-        return result
-    
-    def _color_to_bits_fast(self, color):
-        """Оптимизированный поиск цвета"""
-        color_key = (color[0], color[1], color[2])
-        
-        if color_key in self.color_cache:
-            self.cache_hits += 1
-            return self.color_cache[color_key]
-        
-        self.cache_misses += 1
-        
-        # Быстрая проверка на синий фон
-        if color[0] > 200 and color[1] < 50 and color[2] < 50:
-            self.color_cache[color_key] = '0000'
-            return '0000'
-        
-        # NumPy векторизация
-        color_arr = np.array([color[0], color[1], color[2]], dtype=np.int32)
-        distances = np.sum((self.color_values - color_arr) ** 2, axis=1)
-        best_idx = np.argmin(distances)
-        result = self.color_keys[best_idx]
-        
-        self.color_cache[color_key] = result
-        return result
-    
-    def decode_frame_fast(self, frame):
-        """Быстрое декодирование одного кадра с масштабированием"""
-        # Принудительное масштабирование к оригинальному размеру
-        if frame.shape[1] != self.width or frame.shape[0] != self.height:
-            frame = cv2.resize(frame, (self.width, self.height), 
-                              interpolation=cv2.INTER_NEAREST)
-        
-        blocks = []
-        h, w = frame.shape[:2]
-        
-        for cx, cy in self.block_coords:
-            if cx < w and cy < h:
-                color = frame[cy, cx]
-                bits = self._color_to_bits_fast(color)
-                blocks.append(bits)
+def bytes_from_nibbles(nibs: list[int]) -> bytes:
+    """Список 4-битных → байты. Если нечётное — дополняет нулём."""
+    out = bytearray()
+    for i in range(0, len(nibs) - 1, 2):
+        out.append((nibs[i] << 4) | (nibs[i + 1] & 0x0F))
+    if len(nibs) % 2 == 1:
+        out.append((nibs[-1] << 4))
+    return bytes(out)
+
+
+def crc16(data: bytes) -> int:
+    """CRC-16/CCITT."""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = (crc << 1) ^ 0x1021
             else:
-                blocks.append('0000')
-        
-        return blocks
-    
-    def _blocks_to_bytes(self, blocks):
-        """4-битные блоки -> байты"""
-        all_bits = ''.join(blocks)
-        bytes_data = bytearray()
-        
-        for i in range(0, len(all_bits) - 7, 8):
-            byte_str = all_bits[i:i+8]
-            if len(byte_str) == 8:
-                try:
-                    byte = int(byte_str, 2)
-                    bytes_data.append(byte)
-                except:
-                    bytes_data.append(0)
-        
-        return bytes_data
-    
-    def _find_eof_marker(self, data):
-        """Поиск маркера конца █████... в данных"""
-        eof_bytes = b'\xe2\x96\x88' * 64
-        
-        for i in range(len(data) - len(eof_bytes)):
-            if data[i:i+len(eof_bytes)] == eof_bytes:
-                return i
-        return -1
-    
-    def decode(self, video_file, output_dir='.'):
-        """Декодирует видео"""
-        
-        print("\n📥 ДЕКОДИРОВАНИЕ ВИДЕО")
-        print("-" * 40)
-        
+                crc <<= 1
+            crc &= 0xFFFF
+    return crc
+
+
+def encode_uint16_as_nibbles(value: int) -> list[int]:
+    """uint16 → 4 nibble (big-endian)."""
+    return [
+        (value >> 12) & 0xF,
+        (value >> 8) & 0xF,
+        (value >> 4) & 0xF,
+        value & 0xF,
+    ]
+
+
+def decode_nibbles_to_uint16(nibs: list[int]) -> int:
+    """4 nibble → uint16."""
+    return (nibs[0] << 12) | (nibs[1] << 8) | (nibs[2] << 4) | nibs[3]
+
+
+def nearest_palette_index(bgr_pixel, palette_np=PALETTE_NP) -> int:
+    """Ближайший цвет палитры для BGR-пикселя (евклидово расстояние)."""
+    diff = palette_np - np.array(bgr_pixel, dtype=np.int32)
+    dists = np.sum(diff * diff, axis=1)
+    return int(np.argmin(dists))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ШИФРОВАНИЕ AES-256-GCM
+# ═════════════════════════════════════════════════════════════════════════════
+
+SALT_LEN = 16
+NONCE_LEN = 12
+
+
+def derive_key(password: str, salt: bytes) -> bytes:
+    """PBKDF2 → 256-bit ключ."""
+    if not HAS_CRYPTO:
+        raise RuntimeError("Библиотека cryptography не установлена: pip install cryptography")
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32,
+                     salt=salt, iterations=480_000)
+    return kdf.derive(password.encode("utf-8"))
+
+
+def encrypt_data(data: bytes, password: str) -> bytes:
+    """Возвращает salt(16) + nonce(12) + ciphertext+tag."""
+    salt = os.urandom(SALT_LEN)
+    key = derive_key(password, salt)
+    nonce = os.urandom(NONCE_LEN)
+    ct = AESGCM(key).encrypt(nonce, data, None)
+    return salt + nonce + ct
+
+
+def decrypt_data(blob: bytes, password: str) -> bytes:
+    """Обратно расшифровывает то, что вернул encrypt_data."""
+    salt = blob[:SALT_LEN]
+    nonce = blob[SALT_LEN:SALT_LEN + NONCE_LEN]
+    ct = blob[SALT_LEN + NONCE_LEN:]
+    key = derive_key(password, salt)
+    return AESGCM(key).decrypt(nonce, ct, None)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ФОРМАТ ДАННЫХ (бинарный заголовок)
+# ═════════════════════════════════════════════════════════════════════════════
+# Заголовок перед данными файла (всё little-endian):
+#
+#   magic        4 bytes  b"YTC1"
+#   flags        1 byte   bit0=encrypted
+#   filename_len 2 bytes  uint16
+#   filename     N bytes  UTF-8
+#   file_size    8 bytes  uint64 (оригинальный размер до шифрования)
+#   payload_size 8 bytes  uint64 (точный размер payload в байтах)
+#   sha256       32 bytes хеш оригинальных данных
+#   payload      ...      данные файла (или зашифрованные)
+#
+MAGIC = b"YTC1"
+
+
+def build_header(filename: str, file_size: int, payload_size: int,
+                 sha256_hash: bytes, encrypted: bool) -> bytes:
+    """Собирает бинарный заголовок."""
+    fname_bytes = filename.encode("utf-8")
+    flags = 0x01 if encrypted else 0x00
+    hdr = bytearray()
+    hdr += MAGIC
+    hdr += struct.pack("<B", flags)
+    hdr += struct.pack("<H", len(fname_bytes))
+    hdr += fname_bytes
+    hdr += struct.pack("<Q", file_size)
+    hdr += struct.pack("<Q", payload_size)
+    hdr += sha256_hash
+    return bytes(hdr)
+
+
+def parse_header(data: bytes):
+    """
+    Разбирает заголовок. Возвращает (filename, file_size, payload_size, sha256, encrypted, header_len)
+    или None если magic не совпал.
+    """
+    if len(data) < 4 or data[:4] != MAGIC:
+        return None
+    pos = 4
+    flags = data[pos]; pos += 1
+    fname_len = struct.unpack("<H", data[pos:pos+2])[0]; pos += 2
+    filename = data[pos:pos+fname_len].decode("utf-8"); pos += fname_len
+    file_size = struct.unpack("<Q", data[pos:pos+8])[0]; pos += 8
+    payload_size = struct.unpack("<Q", data[pos:pos+8])[0]; pos += 8
+    sha256 = data[pos:pos+32]; pos += 32
+    encrypted = bool(flags & 0x01)
+    return filename, file_size, payload_size, sha256, encrypted, pos
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ENCODER
+# ═════════════════════════════════════════════════════════════════════════════
+
+class Encoder:
+    """Кодирует файл в видео с 3x-redundancy, frame numbering, CRC, AES."""
+
+    def __init__(self, password: str | None = None):
+        self.password = password
+
+    def _make_frame(self, frame_num: int, data_nibbles: list[int]) -> np.ndarray:
+        """
+        Рисует один кадр: чёрный фон, затем 3 полосы-региона
+        с одинаковыми данными. В начале каждого региона — 8 служебных блоков
+        (4 — номер кадра uint16, 4 — CRC16 данных кадра).
+        """
+        frame = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
+
+        # CRC данных кадра
+        data_bytes_for_crc = bytes_from_nibbles(data_nibbles)
+        crc = crc16(data_bytes_for_crc)
+
+        frame_nibs = encode_uint16_as_nibbles(frame_num)
+        crc_nibs = encode_uint16_as_nibbles(crc)
+        header_nibs = frame_nibs + crc_nibs  # 8 nibble
+
+        full_nibs = header_nibs + data_nibbles
+
+        # Рисуем 3 региона (горизонтальные полосы)
+        for region in range(3):
+            row_offset = region * REGION_ROWS
+            for idx, nib in enumerate(full_nibs):
+                row = row_offset + idx // GRID_COLS
+                col = idx % GRID_COLS
+                if row >= row_offset + REGION_ROWS:
+                    break
+                x1 = col * STEP_X
+                y1 = row * STEP_Y
+                x2 = x1 + BLOCK_W
+                y2 = y1 + BLOCK_H
+                if x2 <= WIDTH and y2 <= HEIGHT:
+                    frame[y1:y2, x1:x2] = PALETTE_BGR[nib]
+
+        return frame
+
+    def encode(self, input_file: str, output_file: str) -> bool:
+        """Основной пайплайн кодирования."""
+        # 1. Читаем файл
+        with open(input_file, "rb") as f:
+            raw_data = f.read()
+
+        file_size = len(raw_data)
+        sha256 = hashlib.sha256(raw_data).digest()
+        filename = os.path.basename(input_file)
+        encrypted = self.password is not None
+
+        print(f"  Файл: {filename}")
+        print(f"  Размер: {file_size:,} байт ({file_size/1024/1024:.2f} MB)")
+        print(f"  SHA-256: {sha256.hex()[:16]}...")
+        print(f"  Шифрование: {'AES-256-GCM' if encrypted else 'нет'}")
+
+        # 2. Шифруем
+        if encrypted:
+            payload = encrypt_data(raw_data, self.password)
+            print(f"  Зашифровано: {len(payload):,} байт")
+        else:
+            payload = raw_data
+
+        # 3. Собираем заголовок + payload
+        header = build_header(filename, file_size, len(payload), sha256, encrypted)
+        full_data = header + payload
+
+        # 4. Конвертируем в nibbles
+        all_nibbles = list(nibbles_from_bytes(full_data))
+        total_nibbles = len(all_nibbles)
+
+        # 5. Разбиваем на кадры
+        nibs_per_frame = BLOCKS_PER_REGION
+        total_frames = math.ceil(total_nibbles / nibs_per_frame)
+
+        print(f"  Блоков данных/кадр: {nibs_per_frame}")
+        print(f"  Всего кадров: {total_frames}")
+        print(f"  Длительность: {total_frames/FPS:.1f} сек")
+
+        # 6. Создаём временную папку для кадров
+        temp_dir = tempfile.mkdtemp(prefix="ytcloud_")
+
+        try:
+            # 7. Генерируем кадры
+            for fnum in tqdm(range(total_frames), desc="  Кадры", unit="кадр"):
+                start = fnum * nibs_per_frame
+                end = min(start + nibs_per_frame, total_nibbles)
+                chunk = all_nibbles[start:end]
+                # Дополняем нулями если последний кадр неполный
+                if len(chunk) < nibs_per_frame:
+                    chunk = chunk + [0] * (nibs_per_frame - len(chunk))
+
+                frame = self._make_frame(fnum, chunk)
+                path = os.path.join(temp_dir, f"frame_{fnum:06d}.png")
+                cv2.imwrite(path, frame)
+
+            # 8. Собираем MP4 через FFmpeg
+            print("  Сборка MP4...")
+            cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(FPS),
+                "-i", os.path.join(temp_dir, "frame_%06d.png"),
+                # Настройки для максимального выживания через YouTube:
+                # CRF 0 = lossless (YouTube всё равно пережмёт, но мы даём
+                # максимально чистый исходник).
+                "-c:v", "libx264",
+                "-preset", "slow",
+                "-crf", "0",
+                "-pix_fmt", "yuv444p",
+                "-an",
+                "-movflags", "+faststart",
+                output_file,
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                # Fallback: yuv420p (некоторые ffmpeg не поддерживают yuv444p)
+                cmd[cmd.index("yuv444p")] = "yuv420p"
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    print(f"  ОШИБКА ffmpeg: {r.stderr[-500:]}")
+                    return False
+
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        out_size = os.path.getsize(output_file)
+        print(f"  Видео: {output_file}")
+        print(f"  Размер видео: {out_size:,} байт ({out_size/1024/1024:.2f} MB)")
+        print("  Готово!")
+        return True
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  DECODER
+# ═════════════════════════════════════════════════════════════════════════════
+
+class Decoder:
+    """Декодирует видео обратно в файл с majority-voting по 3 регионам."""
+
+    def __init__(self, password: str | None = None):
+        self.password = password
+        # Кеш nearest-color
+        self._cache: dict[tuple, int] = {}
+
+    def _pixel_to_index(self, bgr) -> int:
+        """BGR → индекс палитры (с кешем)."""
+        key = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
+        if key in self._cache:
+            return self._cache[key]
+        idx = nearest_palette_index(key)
+        self._cache[key] = idx
+        return idx
+
+    def _sample_block(self, frame: np.ndarray, row: int, col: int) -> int:
+        """
+        Считывает один блок, сэмплируя центральную область (60% площади)
+        и возвращая медианный цвет → индекс палитры.
+        """
+        x1 = col * STEP_X
+        y1 = row * STEP_Y
+        # Центральная 60% область
+        margin_x = BLOCK_W // 5
+        margin_y = BLOCK_H // 5
+        cx1 = x1 + margin_x
+        cy1 = y1 + margin_y
+        cx2 = x1 + BLOCK_W - margin_x
+        cy2 = y1 + BLOCK_H - margin_y
+
+        if cx2 > frame.shape[1] or cy2 > frame.shape[0]:
+            return 0
+
+        region = frame[cy1:cy2, cx1:cx2]
+        # Медиана по каждому каналу — устойчива к шуму сжатия
+        median_bgr = np.median(region.reshape(-1, 3), axis=0).astype(np.int32)
+        return self._pixel_to_index(median_bgr)
+
+    def _decode_region(self, frame: np.ndarray, region_idx: int) -> list[int]:
+        """Декодирует один регион кадра → список nibble (header + data)."""
+        row_offset = region_idx * REGION_ROWS
+        nibs = []
+        total_blocks = HEADER_BLOCKS + BLOCKS_PER_REGION
+        for idx in range(total_blocks):
+            row = row_offset + idx // GRID_COLS
+            col = idx % GRID_COLS
+            if row >= row_offset + REGION_ROWS:
+                break
+            nibs.append(self._sample_block(frame, row, col))
+        return nibs
+
+    def _majority_vote(self, regions: list[list[int]]) -> list[int]:
+        """Majority voting по 3 регионам, поблочно."""
+        max_len = max(len(r) for r in regions)
+        result = []
+        for i in range(max_len):
+            votes = []
+            for r in regions:
+                if i < len(r):
+                    votes.append(r[i])
+            if not votes:
+                result.append(0)
+                continue
+            # Считаем голоса
+            counts: dict[int, int] = {}
+            for v in votes:
+                counts[v] = counts.get(v, 0) + 1
+            # Побеждает большинство
+            winner = max(counts, key=counts.get)
+            result.append(winner)
+        return result
+
+    def decode(self, video_file: str, output_dir: str = ".") -> bool:
+        """Основной пайплайн декодирования."""
+
         if not os.path.exists(video_file):
-            print(f"❌ Файл не найден: {video_file}")
+            print(f"  ОШИБКА: файл не найден: {video_file}")
             return False
-        
+
         cap = cv2.VideoCapture(video_file)
         if not cap.isOpened():
-            print("❌ Не удалось открыть видео")
+            print("  ОШИБКА: не удалось открыть видео")
             return False
-        
+
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        print(f"📹 Всего кадров: {total_frames}")
-        print(f"📹 FPS: {fps}")
-        print(f"📹 Разрешение: {width}x{height}")
-        
-        # Сброс статистики
-        self.cache_hits = 0
-        self.cache_misses = 0
-        start_time = cv2.getTickCount()
-        
-        # Сбор блоков
-        all_blocks = []
-        frames_processed = 0
-        
-        for frame_num in range(total_frames):
-            ret, frame = cap.read()
+        vid_fps = cap.get(cv2.CAP_PROP_FPS)
+        vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        print(f"  Кадров: {total_frames}, FPS: {vid_fps:.1f}, {vid_w}x{vid_h}")
+
+        # Собираем данные кадр за кадром
+        frame_data: dict[int, list[int]] = {}  # frame_num → data nibbles
+        errors = 0
+
+        for _ in tqdm(range(total_frames), desc="  Декодирование", unit="кадр"):
+            ret, raw_frame = cap.read()
             if not ret:
                 break
-            
-            frames_processed += 1
-            
-            # Прогресс
-            if frame_num % 100 == 0:
-                elapsed = (cv2.getTickCount() - start_time) / cv2.getTickFrequency()
-                speed = frames_processed / elapsed if elapsed > 0 else 0
-                cache_ratio = (self.cache_hits / (self.cache_hits + self.cache_misses) * 100) if (self.cache_hits + self.cache_misses) > 0 else 0
-                print(f"  Прогресс: {frame_num}/{total_frames} | "
-                      f"Скорость: {speed:.1f} кадр/сек | "
-                      f"Кэш: {cache_ratio:.1f}%")
-            
-            # Декодирование кадра с масштабированием
-            frame_blocks = self.decode_frame_fast(frame)
-            all_blocks.extend(frame_blocks)
-        
+
+            # Масштабируем к 1920x1080 если нужно
+            if raw_frame.shape[1] != WIDTH or raw_frame.shape[0] != HEIGHT:
+                raw_frame = cv2.resize(raw_frame, (WIDTH, HEIGHT),
+                                       interpolation=cv2.INTER_AREA)
+
+            # Декодируем 3 региона
+            regions = [self._decode_region(raw_frame, r) for r in range(3)]
+
+            # Majority vote
+            voted = self._majority_vote(regions)
+
+            if len(voted) < HEADER_BLOCKS:
+                errors += 1
+                continue
+
+            # Извлекаем header: frame_num (4 nib) + crc16 (4 nib)
+            frame_num = decode_nibbles_to_uint16(voted[:4])
+            frame_crc = decode_nibbles_to_uint16(voted[4:8])
+            data_nibs = voted[8:]
+
+            # Проверяем CRC
+            data_bytes_check = bytes_from_nibbles(data_nibs)
+            actual_crc = crc16(data_bytes_check)
+
+            if actual_crc != frame_crc:
+                # CRC не совпал — возможно повреждён кадр, но всё равно сохраняем
+                errors += 1
+
+            # Дедупликация: если кадр с таким номером уже есть, берём тот что с верным CRC
+            if frame_num not in frame_data or actual_crc == frame_crc:
+                frame_data[frame_num] = data_nibs
+
         cap.release()
-        
-        # Статистика
-        elapsed = (cv2.getTickCount() - start_time) / cv2.getTickFrequency()
-        print(f"\n📊 Статистика: {len(all_blocks)} блоков за {elapsed:.1f} сек")
-        print(f"  🎯 Кэш: попаданий {self.cache_hits}, промахов {self.cache_misses}")
-        print(f"  🔄 Кадров обработано: {frames_processed}")
-        
-        # Конвертация в байты
-        bytes_data = self._blocks_to_bytes(all_blocks)
-        print(f"📦 Получено байт: {len(bytes_data)}")
-        
-        # Поиск маркера конца
-        eof_pos = self._find_eof_marker(bytes_data)
-        if eof_pos > 0:
-            bytes_data = bytes_data[:eof_pos]
-            print(f"✅ Найден маркер конца на позиции {eof_pos}")
-            print(f"📦 Байт после обрезки: {len(bytes_data)}")
+
+        print(f"  Уникальных кадров: {len(frame_data)}")
+        if errors:
+            print(f"  CRC-ошибок: {errors}")
+
+        if not frame_data:
+            print("  ОШИБКА: не удалось декодировать ни одного кадра")
+            return False
+
+        # Собираем nibbles в правильном порядке
+        max_frame = max(frame_data.keys())
+        all_nibbles: list[int] = []
+        missing_frames = []
+        for fnum in range(max_frame + 1):
+            if fnum in frame_data:
+                all_nibbles.extend(frame_data[fnum])
+            else:
+                missing_frames.append(fnum)
+                # Заполняем нулями — данные потеряны
+                all_nibbles.extend([0] * BLOCKS_PER_REGION)
+
+        if missing_frames:
+            print(f"  ВНИМАНИЕ: пропущены кадры: {missing_frames[:20]}{'...' if len(missing_frames) > 20 else ''}")
+
+        # Конвертируем nibbles → bytes
+        raw_bytes = bytes_from_nibbles(all_nibbles)
+
+        # Парсим заголовок
+        parsed = parse_header(raw_bytes)
+        if parsed is None:
+            print("  ОШИБКА: заголовок не найден (magic YTC1 не совпал)")
+            # Сохраняем сырые данные
+            fallback = os.path.join(output_dir, "decoded_raw.bin")
+            os.makedirs(output_dir, exist_ok=True)
+            with open(fallback, "wb") as f:
+                f.write(raw_bytes)
+            print(f"  Сырые данные сохранены: {fallback}")
+            return False
+
+        filename, file_size, payload_size, expected_sha, encrypted, hdr_len = parsed
+        print(f"  Файл: {filename}")
+        print(f"  Размер оригинала: {file_size:,} байт")
+        print(f"  Размер payload: {payload_size:,} байт")
+        print(f"  Шифрование: {'AES-256-GCM' if encrypted else 'нет'}")
+
+        # Извлекаем payload — точно payload_size байт
+        payload = raw_bytes[hdr_len:hdr_len + payload_size]
+
+        # Расшифровываем если нужно
+        if encrypted:
+            if not self.password:
+                print("  ОШИБКА: файл зашифрован, но пароль не указан")
+                return False
+            if not HAS_CRYPTO:
+                print("  ОШИБКА: нужна библиотека cryptography: pip install cryptography")
+                return False
+            try:
+                file_data = decrypt_data(payload, self.password)
+            except Exception as e:
+                print(f"  ОШИБКА расшифровки: {e}")
+                return False
         else:
-            print("⚠️ Маркер конца не найден")
-        
-        # Поиск заголовка
-        data_str = bytes_data[:1000].decode('latin-1', errors='ignore')
-        pattern = r'FILE:([^:]+):SIZE:(\d+)\|'
-        match = re.search(pattern, data_str)
-        
-        if match:
-            filename = match.group(1)
-            filesize = int(match.group(2))
-            
-            print(f"\n✅ Найден заголовок: {filename}, размер: {filesize} байт")
-            
-            header_str = match.group(0)
-            header_bytes = header_str.encode('latin-1')
-            header_pos = bytes_data.find(header_bytes)
-            
-            if header_pos >= 0:
-                # Извлекаем зашифрованные данные
-                encrypted_data = bytes_data[header_pos + len(header_bytes):header_pos + len(header_bytes) + filesize]
-                
-                # Дешифруем если есть ключ
-                if self.key:
-                    file_data = self._decrypt_data(encrypted_data)
-                    print(f"🔓 Данные расшифрованы")
-                else:
-                    file_data = encrypted_data
-                    print(f"⚠️ Данные без расшифровки")
-                
-                # Сохраняем файл
-                output_path = os.path.join(output_dir, filename)
-                counter = 1
-                base, ext = os.path.splitext(filename)
-                while os.path.exists(output_path):
-                    output_path = os.path.join(output_dir, f"{base}_{counter}{ext}")
-                    counter += 1
-                
-                with open(output_path, 'wb') as f:
-                    f.write(file_data)
-                
-                print(f"\n✅ Файл восстановлен: {output_path}")
-                print(f"📏 Размер: {len(file_data)} байт")
-                
-                # Проверка размера
-                if len(file_data) == filesize:
-                    print("✅ Размер совпадает с оригиналом")
-                else:
-                    print(f"⚠️ Размер не совпадает: {len(file_data)} != {filesize}")
-                
-                return True
+            file_data = payload[:file_size]
+
+        # Обрезаем до оригинального размера
+        file_data = file_data[:file_size]
+
+        # Проверяем SHA-256
+        actual_sha = hashlib.sha256(file_data).digest()
+        if actual_sha == expected_sha:
+            print(f"  SHA-256: совпадает!")
         else:
-            print("❌ Заголовок не найден")
-        
-        # Если не нашли заголовок
-        output_path = os.path.join(output_dir, "decoded_data.bin")
-        with open(output_path, 'wb') as f:
-            f.write(bytes_data)
-        print(f"\n💾 Данные сохранены: {output_path}")
-        return False
+            print(f"  ВНИМАНИЕ: SHA-256 НЕ совпадает!")
+            print(f"    Ожидалось: {expected_sha.hex()[:16]}...")
+            print(f"    Получено:  {actual_sha.hex()[:16]}...")
+
+        # Сохраняем файл
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, filename)
+        counter = 1
+        base, ext = os.path.splitext(filename)
+        while os.path.exists(output_path):
+            output_path = os.path.join(output_dir, f"{base}_{counter}{ext}")
+            counter += 1
+
+        with open(output_path, "wb") as f:
+            f.write(file_data)
+
+        print(f"  Сохранено: {output_path}")
+        print(f"  Размер: {len(file_data):,} байт")
+
+        if len(file_data) == file_size and actual_sha == expected_sha:
+            print("  Файл восстановлен без потерь!")
+            return True
+        else:
+            print("  Файл восстановлен с возможными ошибками")
+            return False
 
 
-def read_key_from_file(key_file='key.txt'):
-    """Читает ключ из файла key.txt"""
+# ═════════════════════════════════════════════════════════════════════════════
+#  VERIFY — roundtrip-тест
+# ═════════════════════════════════════════════════════════════════════════════
+
+def verify(input_file: str, password: str | None = None) -> bool:
+    """Encode → Decode → сравнить хеши."""
+    import time
+
+    print("\n  Roundtrip-тест")
+    print("  " + "=" * 50)
+
+    temp_dir = tempfile.mkdtemp(prefix="ytcloud_verify_")
+    video_path = os.path.join(temp_dir, "test.mp4")
+    decode_dir = os.path.join(temp_dir, "decoded")
+    os.makedirs(decode_dir)
+
     try:
-        if os.path.exists(key_file):
-            with open(key_file, 'r', encoding='utf-8') as f:
-                key = f.read().strip()
-                if key:
-                    print(f"🔑 Ключ загружен из {key_file}")
-                    return key
-                else:
-                    print(f"⚠️ Файл {key_file} пуст")
+        # Encode
+        t0 = time.time()
+        enc = Encoder(password)
+        if not enc.encode(input_file, video_path):
+            print("  Кодирование провалилось")
+            return False
+        t_enc = time.time() - t0
+
+        # Decode
+        t0 = time.time()
+        dec = Decoder(password)
+        if not dec.decode(video_path, decode_dir):
+            print("  Декодирование провалилось")
+            return False
+        t_dec = time.time() - t0
+
+        # Сравниваем
+        original = open(input_file, "rb").read()
+        orig_hash = hashlib.sha256(original).hexdigest()
+
+        decoded_file = os.path.join(decode_dir, os.path.basename(input_file))
+        if not os.path.exists(decoded_file):
+            # Ищем любой файл
+            files = os.listdir(decode_dir)
+            if files:
+                decoded_file = os.path.join(decode_dir, files[0])
+            else:
+                print("  Декодированный файл не найден")
+                return False
+
+        decoded = open(decoded_file, "rb").read()
+        dec_hash = hashlib.sha256(decoded).hexdigest()
+
+        print(f"\n  Оригинал:      {len(original):,} байт, SHA-256: {orig_hash[:16]}...")
+        print(f"  Декодированный: {len(decoded):,} байт, SHA-256: {dec_hash[:16]}...")
+        print(f"  Кодирование: {t_enc:.1f} сек")
+        print(f"  Декодирование: {t_dec:.1f} сек")
+
+        if orig_hash == dec_hash:
+            print("  ТЕСТ ПРОЙДЕН — данные идентичны!")
+            return True
         else:
-            print(f"ℹ️ Файл {key_file} не найден, шифрование не используется")
-    except Exception as e:
-        print(f"⚠️ Ошибка чтения ключа: {e}")
-    
+            print("  ТЕСТ НЕ ПРОЙДЕН — данные различаются!")
+            # Найти первое различие
+            for i in range(min(len(original), len(decoded))):
+                if original[i] != decoded[i]:
+                    print(f"  Первое различие на байте {i}")
+                    break
+            return False
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ═════════════════════════════════════════════════════════════════════════════
+
+def read_password(key_file: str = "key.txt") -> str | None:
+    """Читает пароль из key.txt если он есть."""
+    if os.path.exists(key_file):
+        with open(key_file, "r", encoding="utf-8") as f:
+            pw = f.read().strip()
+        if pw:
+            print(f"  Ключ загружен из {key_file}")
+            return pw
     return None
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("\n" + "="*60)
-        print("🎥 YouTube File Storage (6 FPS)")
-        print("="*60)
-        print("\nИспользование:")
-        print("  encode <файл> [output.mp4]  - закодировать файл")
-        print("  decode <видео> [папка]      - декодировать видео")
-        print("\nХарактеристики:")
-        print("  • Частота кадров: 6 FPS")
-        print("  • Масштабирование к 1920x1080")
-        print("  • Маркер конца данных")
-        print("  • 5 защитных кадров")
-        print("\nШифрование:")
-        print("  • Для шифрования создайте key.txt с ключом")
-        return
-    
-    # Читаем ключ из файла
-    key = read_key_from_file()
-    
-    if sys.argv[1] == "encode":
-        encoder = YouTubeEncoder(key)
-        input_file = sys.argv[2]
-        output = sys.argv[3] if len(sys.argv) > 3 else "output.mp4"
-        encoder.encode(input_file, output)
-        
-    elif sys.argv[1] == "decode":
-        decoder = YouTubeDecoder(key)
-        video_file = sys.argv[2]
-        output_dir = sys.argv[3] if len(sys.argv) > 3 else "."
-        decoder.decode(video_file, output_dir)
-    else:
-        print(f"❌ Неизвестная команда: {sys.argv[1]}")
+    parser = argparse.ArgumentParser(
+        description="yt-cloud — стеганографическое хранение файлов в видео",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Примеры:
+  %(prog)s encode secret.zip               → output.mp4
+  %(prog)s encode secret.zip video.mp4     → video.mp4
+  %(prog)s decode video.mp4                → текущая папка
+  %(prog)s decode video.mp4 ./recovered/   → ./recovered/
+  %(prog)s verify secret.zip               → encode→decode→сравнить
+
+Шифрование:
+  Создайте файл key.txt с паролем, или используйте --key:
+  %(prog)s encode --key mypassword secret.zip
+""",
+    )
+
+    parser.add_argument("command", choices=["encode", "decode", "verify"],
+                        help="encode|decode|verify")
+    parser.add_argument("input", help="Входной файл (encode/verify) или видео (decode)")
+    parser.add_argument("output", nargs="?", default=None,
+                        help="Выходной файл/папка (по умолчанию: output.mp4 / .)")
+    parser.add_argument("--key", "-k", default=None,
+                        help="Пароль для шифрования (или key.txt)")
+
+    args = parser.parse_args()
+
+    # Определяем пароль
+    password = args.key or read_password()
+
+    print()
+    print("=" * 58)
+    print("  yt-cloud coder v2.0")
+    print("=" * 58)
+
+    if args.command == "encode":
+        if not os.path.exists(args.input):
+            print(f"  ОШИБКА: файл не найден: {args.input}")
+            sys.exit(1)
+        output = args.output or "output.mp4"
+        enc = Encoder(password)
+        ok = enc.encode(args.input, output)
+        sys.exit(0 if ok else 1)
+
+    elif args.command == "decode":
+        output_dir = args.output or "."
+        dec = Decoder(password)
+        ok = dec.decode(args.input, output_dir)
+        sys.exit(0 if ok else 1)
+
+    elif args.command == "verify":
+        if not os.path.exists(args.input):
+            print(f"  ОШИБКА: файл не найден: {args.input}")
+            sys.exit(1)
+        ok = verify(args.input, password)
+        sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":
